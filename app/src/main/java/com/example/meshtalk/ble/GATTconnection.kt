@@ -29,7 +29,7 @@ class DualRoleBleManager(private val context: Context) {
 
     // --- UUIDs (example UUIDs) ---
     companion object {
-        val SERVICE_UUID: UUID = UUID.fromString("0000feed-0000-1000-8000-00805f9b34fb")
+        val SERVICE_UUID: UUID = UUID.fromString("0000abcd-0000-1000-8000-00805f9b34fb")
         val RX_CHAR_UUID: UUID = UUID.fromString("0000beef-0000-1000-8000-00805f9b34fb") // client -> server (WRITE)
         val TX_CHAR_UUID: UUID = UUID.fromString("0000cafe-0000-1000-8000-00805f9b34fb") // server -> client (NOTIFY)
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
@@ -37,9 +37,6 @@ class DualRoleBleManager(private val context: Context) {
 
     private val bluetoothManager: BluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
-
-    // Peripheral/server side
-    private var bluetoothLeAdvertiser: BluetoothLeAdvertiser? = null
     private var gattServer: BluetoothGattServer? = null
     private val connectedDevices = mutableSetOf<BluetoothDevice>()
 
@@ -71,10 +68,15 @@ class DualRoleBleManager(private val context: Context) {
             Log.e(TAG, "Unable to create GATT server")
             return
         }
+        else{
+            Log.d(TAG, "created the GATT server")
+        }
 
         // Create service
         val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
-
+        if(service != null) {
+            Log.d(TAG, "created the service")
+        }
         // RX characteristic (WRITE): client writes to this char to send data to the server
         val rxChar = BluetoothGattCharacteristic(
             RX_CHAR_UUID,
@@ -82,6 +84,9 @@ class DualRoleBleManager(private val context: Context) {
             BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
             BluetoothGattCharacteristic.PERMISSION_WRITE
         )
+        if(rxChar != null) {
+            Log.d(TAG, "created the rxChar")
+        }
 
         // TX characteristic (NOTIFY): server sends notifications to clients
         val txChar = BluetoothGattCharacteristic(
@@ -89,9 +94,15 @@ class DualRoleBleManager(private val context: Context) {
             BluetoothGattCharacteristic.PROPERTY_NOTIFY,
             BluetoothGattCharacteristic.PERMISSION_READ // permission on server side; client uses enable notification
         )
+        if(txChar != null) {
+            Log.d(TAG, "created the txChar")
+        }
 
         // CCCD descriptor for notifications
         val cccd = BluetoothGattDescriptor(CCCD_UUID, BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE)
+        if(cccd != null) {
+            Log.d(TAG, "created the cccd")
+        }
         txChar.addDescriptor(cccd)
 
         service.addCharacteristic(rxChar)
@@ -115,7 +126,9 @@ class DualRoleBleManager(private val context: Context) {
     private val gattServerCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
             super.onConnectionStateChange(device, status, newState)
+            Log.i(TAG, "first override")
             device ?: return
+
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 connectedDevices.add(device)
                 Log.i(TAG, "Server: device connected: ${device.address}")
@@ -133,6 +146,7 @@ class DualRoleBleManager(private val context: Context) {
             // This server does not expect reads for our example, but respond gracefully
             val value = characteristic.value ?: byteArrayOf()
             gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, value)
+            Log.i(TAG, "second override")
         }
 
         @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
@@ -148,10 +162,11 @@ class DualRoleBleManager(private val context: Context) {
             super.onCharacteristicWriteRequest(device, requestId, characteristic, preparedWrite, responseNeeded, offset, value)
             device ?: return
             characteristic ?: return
-
+            Log.i(TAG, "third override")
             if (characteristic.uuid == RX_CHAR_UUID) {
                 val text = value?.toString(Charset.forName("UTF-8")) ?: ""
                 Log.i(TAG, "Server received from client(${device.address}): $text")
+
 
                 // You can react to incoming message here (e.g., update UI via a callback)
 
@@ -178,10 +193,13 @@ class DualRoleBleManager(private val context: Context) {
             super.onDescriptorWriteRequest(device, requestId, descriptor, preparedWrite, responseNeeded, offset, value)
             device ?: return
             descriptor ?: return
+            Log.i(TAG, "forth override")
 
             if (descriptor.uuid == CCCD_UUID) {
                 val enabled = Arrays.equals(value, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                Log.i(TAG, "Server descriptor write: enable notifications=$enabled from ${device.address}")
+                val text = value?.toString(Charsets.UTF_8) ?: ""
+                val bytes = value ?: byteArrayOf()
+                Log.i(TAG, "Received bytes (hex): ${bytes.joinToString(" ") { "%02X".format(it) }}")
                 if (responseNeeded) {
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
                 }
@@ -304,7 +322,7 @@ class DualRoleBleManager(private val context: Context) {
 //    }
 
     @SuppressLint("MissingPermission")
-    private fun connectToDevice(device: BluetoothDevice) {
+    fun connectToDevice(device: BluetoothDevice) {
         Log.i(TAG, "Connecting to device: ${device.address}")
         // false -> not autoConnect
         bluetoothGatt = device.connectGatt(context, false, gattClientCallback)

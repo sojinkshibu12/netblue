@@ -20,10 +20,11 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.example.dualroleble.DualRoleBleManager
 import com.example.meshtalk.ble.BleAdvertiser
 import com.example.meshtalk.ui.Device
 import com.example.meshtalk.ui.DeviceAdapter
-//import com.example.meshtalk.ble.GATTconnection
+
 
 
 @SuppressLint("MissingPermission")
@@ -46,6 +47,7 @@ class MainActivity : AppCompatActivity() {
     private val REQUEST_DISCOVERABLE_BT = 3
     private val REQUEST_ADVERT_PERMS = 2002
     private val deviceAdapter = DeviceAdapter(deviceList,this)
+    lateinit var dualrole: DualRoleBleManager
 
 
 
@@ -64,6 +66,7 @@ class MainActivity : AppCompatActivity() {
 
         adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1)
         listView.adapter = adapter
+        dualrole = DualRoleBleManager(this)
 
         fun checkPermissionsAndEnableBluetooth() {
 
@@ -115,7 +118,9 @@ class MainActivity : AppCompatActivity() {
         )
 
         // Initialize BleAdvertiser AFTER bluetoothAdapter is available
-        bleAdvertiser = BleAdvertiser(this) // assumes BleAdvertiser class as shown earlier
+        bleAdvertiser = BleAdvertiser(this)
+
+
 
         // Discover (BLE scan)
         btnDiscover.setOnClickListener {
@@ -145,6 +150,7 @@ class MainActivity : AppCompatActivity() {
             }
             // Start advertising (BleAdvertiser handles its own permission checks too)
             bleAdvertiser.startAdvertising()
+            dualrole.startGattServer()
             statusText.text = "Status: Advertising..."
         }
 
@@ -157,7 +163,8 @@ class MainActivity : AppCompatActivity() {
             }
             val device = bldevices[position]
             Log.d("item click" , "device-name :${device.name}")
-//            gattconnection.connect(device,this)
+            dualrole.connectToDevice(device)
+            dualrole.clientWrite("hi i am motorola")
 //            val intent = Intent(this, ChatActivity::class.java).apply {
 //                putExtra("device_address", device.address)
 //            }
@@ -191,6 +198,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        dualrole.stopGattServer()
         if (this::bleScanner.isInitialized && bleScanner.isScanning()) {
             bleScanner.stopScan()
         }
@@ -199,3 +207,5 @@ class MainActivity : AppCompatActivity() {
         }
     }
 }
+
+
