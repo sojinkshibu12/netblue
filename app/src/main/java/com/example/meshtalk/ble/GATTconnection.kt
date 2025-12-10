@@ -3,56 +3,69 @@ package com.example.dualroleble
 import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.*
-import android.bluetooth.le.*
 import android.content.Context
-import android.content.pm.PackageManager
-import android.os.Build
-import android.os.ParcelUuid
 import android.util.Log
 import androidx.annotation.RequiresPermission
-import androidx.core.content.ContextCompat
 import java.nio.charset.Charset
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.collections.ArrayDeque
 
 /**
  * DualRoleBleManager
- * - Starts a GATT Server (Peripheral) exposing a simple service with a WRITE (RX) characteristic
- *   and a NOTIFY (TX) characteristic.
- * - Starts scanning + GATT Client to connect to peers that advertise the same service.
- *
- * NOTE: This file is a single-file, minimal dual-role manager meant as a starting point.
- * You must request runtime permissions (BLUETOOTH_SCAN, BLUETOOTH_CONNECT, ACCESS_FINE_LOCATION on older Android)
- * from your Activity before using client APIs and BLUETOOTH_ADVERTISE for advertising on some devices.
+ * - Single-file dual-role BLE manager (GATT Server + simple GATT Client)
+ * - Improvements added:
+ *   * Client-side write queue with MTU-aware chunking
+ *   * Reliable writes (WRITE_TYPE_DEFAULT) by default and queue processing on onCharacteristicWrite
+ *   * Store discovered remote RX characteristic to avoid repeated lookups
+ *   * Track current MTU and use it for chunk sizing
+ *   * Fix pending reply queue usage and make notify behavior deterministic
+ *   * Minor safety and logging improvements
  */
 class DualRoleBleManager(private val context: Context) {
     private val TAG = "DualRoleBleManager"
 
-    // --- UUIDs (example UUIDs) ---
     companion object {
         val SERVICE_UUID: UUID = UUID.fromString("0000abcd-0000-1000-8000-00805f9b34fb")
-        val RX_CHAR_UUID: UUID = UUID.fromString("0000beef-0000-1000-8000-00805f9b34fb") // client -> server (WRITE)
-        val TX_CHAR_UUID: UUID = UUID.fromString("0000cafe-0000-1000-8000-00805f9b34fb") // server -> client (NOTIFY)
-        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-    }
+        val RX_CHAR_UUID: UUID = UUID.fromString("0000beef-0000-1000-8000-00805f9b34fb")
+        val TX_CHAR_UUID: UUID = UUID.fromString("0000cafe-0000-1000-8000-00805f9b34fb")
+        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb") }
 
     private val bluetoothManager: BluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
     private var gattServer: BluetoothGattServer? = null
-    private val connectedDevices = mutableSetOf<BluetoothDevice>()
+
+    // track which devices enabled notifications (store device.address)
+    private val notifyEnabledDevices = Collections.synchronizedSet(mutableSetOf<String>())
+    // make connectedDevices synchronized
+    private val connectedDevices = Collections.synchronizedSet(mutableSetOf<BluetoothDevice>())
+
+    // map of pending replies per device (if device hasn't enabled notifications yet)
+    private val pendingReplies = ConcurrentHashMap<String, ArrayDeque<String>>()
 
     // Client side
-//    private var bluetoothLeScanner: BluetoothLeScanner? = null
-//    private var scanning = false
     private var bluetoothGatt: BluetoothGatt? = null
+
+    /**
+     * Optional callback invoked when the manager establishes a client (central) connection.
+     * MainActivity can set this to be notified and then call clientWrite(...) safely.
+     */
+    var onClientConnected: ((BluetoothDevice) -> Unit)? = null
+
+    // cache of remote RX characteristic
+    private var remoteRxCharacteristic: BluetoothGattCharacteristic? = null // cached after services discovered
+
 
     // Local references for server characteristics so the server can send notifications
     private var serverTxCharacteristic: BluetoothGattCharacteristic? = null
     private var serverRxCharacteristic: BluetoothGattCharacteristic? = null
 
-//    init {
-//        bluetoothLeAdvertiser = bluetoothAdapter?.bluetoothLeAdvertiser
-//        bluetoothLeScanner = bluetoothAdapter?.bluetoothLeScanner
-//    }
+    // ------------------ CLIENT WRITE QUEUE / MTU ------------------
+    private val writeQueue: ArrayDeque<Pair<BluetoothGattCharacteristic, ByteArray>> = ArrayDeque()
+    @Volatile
+    private var writeInProgress = false
+    @Volatile
+    private var currentMtu: Int = 23 // default until onMtuChanged
 
     // ------------------ GATT SERVER (Peripheral) ------------------
 
@@ -67,42 +80,29 @@ class DualRoleBleManager(private val context: Context) {
         if (gattServer == null) {
             Log.e(TAG, "Unable to create GATT server")
             return
-        }
-        else{
+        } else {
             Log.d(TAG, "created the GATT server")
         }
 
         // Create service
         val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
-        if(service != null) {
-            Log.d(TAG, "created the service")
-        }
+
         // RX characteristic (WRITE): client writes to this char to send data to the server
         val rxChar = BluetoothGattCharacteristic(
             RX_CHAR_UUID,
-            // allow write without response & write
             BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
             BluetoothGattCharacteristic.PERMISSION_WRITE
         )
-        if(rxChar != null) {
-            Log.d(TAG, "created the rxChar")
-        }
 
         // TX characteristic (NOTIFY): server sends notifications to clients
         val txChar = BluetoothGattCharacteristic(
             TX_CHAR_UUID,
             BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-            BluetoothGattCharacteristic.PERMISSION_READ // permission on server side; client uses enable notification
+            BluetoothGattCharacteristic.PERMISSION_READ
         )
-        if(txChar != null) {
-            Log.d(TAG, "created the txChar")
-        }
 
         // CCCD descriptor for notifications
         val cccd = BluetoothGattDescriptor(CCCD_UUID, BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE)
-        if(cccd != null) {
-            Log.d(TAG, "created the cccd")
-        }
         txChar.addDescriptor(cccd)
 
         service.addCharacteristic(rxChar)
@@ -121,12 +121,14 @@ class DualRoleBleManager(private val context: Context) {
         gattServer?.close()
         gattServer = null
         connectedDevices.clear()
+        notifyEnabledDevices.clear()
+        pendingReplies.clear()
     }
 
     private val gattServerCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
             super.onConnectionStateChange(device, status, newState)
-            Log.i(TAG, "first override")
+            Log.i(TAG, "onConnectionStateChange device=${device?.address} status=$status newState=$newState")
             device ?: return
 
             if (newState == BluetoothProfile.STATE_CONNECTED) {
@@ -134,6 +136,7 @@ class DualRoleBleManager(private val context: Context) {
                 Log.i(TAG, "Server: device connected: ${device.address}")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 connectedDevices.remove(device)
+                notifyEnabledDevices.remove(device.address)
                 Log.i(TAG, "Server: device disconnected: ${device.address}")
             }
         }
@@ -143,10 +146,9 @@ class DualRoleBleManager(private val context: Context) {
             super.onCharacteristicReadRequest(device, requestId, offset, characteristic)
             device ?: return
             characteristic ?: return
-            // This server does not expect reads for our example, but respond gracefully
             val value = characteristic.value ?: byteArrayOf()
             gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, value)
-            Log.i(TAG, "second override")
+            Log.i(TAG, "onCharacteristicReadRequest device=${device.address} char=${characteristic.uuid}")
         }
 
         @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
@@ -160,15 +162,32 @@ class DualRoleBleManager(private val context: Context) {
             value: ByteArray?
         ) {
             super.onCharacteristicWriteRequest(device, requestId, characteristic, preparedWrite, responseNeeded, offset, value)
+            Log.d(TAG,"device : ${device} char : ${characteristic?.uuid === RX_CHAR_UUID}")
             device ?: return
             characteristic ?: return
-            Log.i(TAG, "third override")
+
+            Log.i(TAG, "CHAR WRITE from=${device.address} charUuid=${characteristic.uuid} len=${value?.size ?: 0}")
+            val bytes = value ?: byteArrayOf()
+            Log.i(TAG, "CHAR Received bytes (hex): ${bytes.joinToString(" ") { "%02X".format(it) }}")
+            Log.i(TAG, "notifyEnabledDevices contains ${device.address}? ${notifyEnabledDevices.contains(device.address)}")
+            Log.i(TAG, "connectedDevices contains ${device.address}? ${connectedDevices.any { it.address == device.address }}")
+
+            if (offset != 0) {
+                if (responseNeeded) gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, 0, null)
+                return
+            }
+            if (preparedWrite) {
+                if (responseNeeded) gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, 0, null)
+                return
+            }
+
             if (characteristic.uuid == RX_CHAR_UUID) {
-                val text = value?.toString(Charset.forName("UTF-8")) ?: ""
+                val text = try { String(bytes, Charsets.UTF_8) } catch (e: Exception) { bytes.joinToString(" ") { "%02X".format(it) } }
                 Log.i(TAG, "Server received from client(${device.address}): $text")
 
-
-                // You can react to incoming message here (e.g., update UI via a callback)
+                // Prefer notifying the specific device that sent the message
+                // send text as-is (don't add duplicate "Echo:" twice)
+                notifyDevice(device, "Echo: $text")
 
                 if (responseNeeded) {
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
@@ -193,15 +212,28 @@ class DualRoleBleManager(private val context: Context) {
             super.onDescriptorWriteRequest(device, requestId, descriptor, preparedWrite, responseNeeded, offset, value)
             device ?: return
             descriptor ?: return
-            Log.i(TAG, "forth override")
+
+            Log.i(TAG, "DESCRIPTOR WRITE from=${device.address} descUuid=${descriptor.uuid} value=${value?.joinToString(" ") { "%02X".format(it) }}")
 
             if (descriptor.uuid == CCCD_UUID) {
+                // persist the written value on the descriptor object
+                descriptor.value = value
+
                 val enabled = Arrays.equals(value, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                val text = value?.toString(Charsets.UTF_8) ?: ""
-                val bytes = value ?: byteArrayOf()
-                Log.i(TAG, "Received bytes (hex): ${bytes.joinToString(" ") { "%02X".format(it) }}")
+                if (enabled) notifyEnabledDevices.add(device.address) else notifyEnabledDevices.remove(device.address)
+
+                Log.i(TAG, "Server descriptor write: enable notifications=$enabled from ${device.address}")
+
                 if (responseNeeded) {
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+                }
+
+                // If we have queued replies for this device, send them now
+                if (enabled) {
+                    val q = pendingReplies.remove(device.address)
+                    q?.forEach { msg ->
+                        notifyDevice(device, msg)
+                    }
                 }
             } else {
                 if (responseNeeded) {
@@ -213,118 +245,52 @@ class DualRoleBleManager(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     fun notifyConnectedClients(text: String) {
-        val bytes = text.toByteArray(Charset.forName("UTF-8"))
+        Log.d(TAG, "notifyConnectedClients: $text")
+        val bytes = text.toByteArray(Charsets.UTF_8)
         val char = serverTxCharacteristic ?: run {
             Log.w(TAG, "serverTxCharacteristic is null")
             return
         }
         char.value = bytes
 
-        // Notify each connected device
         connectedDevices.forEach { device ->
+            if (!notifyEnabledDevices.contains(device.address)) {
+                Log.d(TAG, "Skipping notify: ${device.address} has not enabled notifications; queueing")
+                pendingReplies.getOrPut(device.address) { ArrayDeque() }.add(text)
+                return@forEach
+            }
             val success = gattServer?.notifyCharacteristicChanged(device, char, false) ?: false
             Log.i(TAG, "notify to ${device.address} success=$success")
         }
     }
 
-    // ------------------ ADVERTISING (Peripheral) ------------------
+    @SuppressLint("MissingPermission")
+    fun notifyDevice(device: BluetoothDevice, text: String) {
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        val char = serverTxCharacteristic ?: run {
+            Log.w(TAG, "serverTxCharacteristic is null")
+            return
+        }
+        char.value = bytes
 
-//    @SuppressLint("MissingPermission")
-//    fun startAdvertising() {
-//        if (bluetoothLeAdvertiser == null) {
-//            Log.w(TAG, "Device does not support BLE advertising")
-//            return
-//        }
-//
-//        val settings = AdvertiseSettings.Builder()
-//            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-//            .setConnectable(true)
-//            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-//            .build()
-//
-//        val data = AdvertiseData.Builder()
-//            .setIncludeDeviceName(true)
-//            .addServiceUuid(ParcelUuid(SERVICE_UUID))
-//            .build()
-//
-//        val scanResp = AdvertiseData.Builder()
-//            .addServiceUuid(ParcelUuid(SERVICE_UUID))
-//            .build()
-//
-//        bluetoothLeAdvertiser?.startAdvertising(settings, data, scanResp, advertiseCallback)
-//        Log.i(TAG, "Started advertising service $SERVICE_UUID")
-//    }
-//
-//    @SuppressLint("MissingPermission")
-//    fun stopAdvertising() {
-//        bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
-//    }
-//
-//    private val advertiseCallback = object : AdvertiseCallback() {
-//        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-//            super.onStartSuccess(settingsInEffect)
-//            Log.i(TAG, "Advertise started")
-//        }
-//
-//        override fun onStartFailure(errorCode: Int) {
-//            super.onStartFailure(errorCode)
-//            Log.e(TAG, "Advertise failed: $errorCode")
-//        }
-//    }
+        // ensure device enabled notifications
+        if (!notifyEnabledDevices.contains(device.address)) {
+            Log.d(TAG, "Not notifying ${device.address}: notifications not enabled; queueing reply")
+            pendingReplies.getOrPut(device.address) { ArrayDeque() }.add(text)
+            return
+        }
 
-    // ------------------ GATT CLIENT (Central) ------------------
+        val success = gattServer?.notifyCharacteristicChanged(device, char, false) ?: false
+        Log.i(TAG, "notify to ${device.address} queued success=$success")
+    }
 
-//    // Scanning
-//    @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT])
-//    fun startScan() {
-//        if (bluetoothLeScanner == null) return
-//        if (scanning) return
-//
-//        val filter = ScanFilter.Builder()
-//            .setServiceUuid(ParcelUuid(SERVICE_UUID))
-//            .build()
-//        val settings = ScanSettings.Builder()
-//            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-//            .build()
-//
-//        bluetoothLeScanner?.startScan(listOf(filter), settings, scanCallback)
-//        scanning = true
-//        Log.i(TAG, "Started scanning for service $SERVICE_UUID")
-//    }
-//
-//    @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_SCAN])
-//    fun stopScan() {
-//        if (bluetoothLeScanner == null) return
-//        if (!scanning) return
-//        bluetoothLeScanner?.stopScan(scanCallback)
-//        scanning = false
-//    }
-//
-//    private val scanCallback = object : ScanCallback() {
-//        @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
-//        override fun onScanResult(callbackType: Int, result: ScanResult?) {
-//            super.onScanResult(callbackType, result)
-//            result ?: return
-//            val device = result.device
-//            Log.i(TAG, "Scan found ${device.address} name=${device.name}")
-//
-//            // Auto connect policy: connect if we don't have a connection already
-//            if (bluetoothGatt == null) {
-//                connectToDevice(device)
-//                stopScan()
-//            }
-//        }
-//
-//        override fun onScanFailed(errorCode: Int) {
-//            super.onScanFailed(errorCode)
-//            Log.e(TAG, "Scan failed: $errorCode")
-//        }
-//    }
+    // ------------------ CLIENT (Central) ------------------
 
     @SuppressLint("MissingPermission")
     fun connectToDevice(device: BluetoothDevice) {
         Log.i(TAG, "Connecting to device: ${device.address}")
-        // false -> not autoConnect
+        // store/replace previous connection
+        bluetoothGatt?.close()
         bluetoothGatt = device.connectGatt(context, false, gattClientCallback)
     }
 
@@ -334,7 +300,15 @@ class DualRoleBleManager(private val context: Context) {
             super.onConnectionStateChange(gatt, status, newState)
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 Log.i(TAG, "Client connected -> discoverServices")
-                // request MTU (best-effort)
+                // notify listener that client connected (UI can now safely call clientWrite)
+                try {
+                    onClientConnected?.invoke(gatt.device)
+                } catch (e: Exception) {
+                    Log.w(TAG, "onClientConnected handler threw: ${'$'}{e.message}")
+                }
+                // keep reference
+                bluetoothGatt = gatt
+                // try request high MTU (best-effort)
                 try {
                     gatt.requestMtu(247)
                 } catch (e: Exception) {
@@ -345,43 +319,115 @@ class DualRoleBleManager(private val context: Context) {
                 Log.i(TAG, "Client disconnected")
                 bluetoothGatt?.close()
                 bluetoothGatt = null
+                remoteRxCharacteristic = null
+                synchronized(writeQueue) { writeQueue.clear() }
+                writeInProgress = false
             }
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             super.onMtuChanged(gatt, mtu, status)
-            Log.i(TAG, "MTU changed: $mtu status=$status")
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                currentMtu = mtu
+                Log.i(TAG, "MTU changed: $mtu")
+            } else {
+                Log.w(TAG, "MTU change failed status=$status")
+            }
         }
 
         @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             super.onServicesDiscovered(gatt, status)
-            if (status != BluetoothGatt.GATT_SUCCESS) return
-            val svc = gatt.getService(SERVICE_UUID) ?: return
-            val rx = svc.getCharacteristic(RX_CHAR_UUID) // client writes to this
-            val tx = svc.getCharacteristic(TX_CHAR_UUID) // client enables notifications on this
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(TAG, "Service discovery failed: status=$status")
+                return
+            }
 
-            if (tx != null) {
-                gatt.setCharacteristicNotification(tx, true)
-                val desc = tx.getDescriptor(CCCD_UUID)
-                desc?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                desc?.let { gatt.writeDescriptor(it) }
+            val svc = gatt.getService(SERVICE_UUID)
+            if (svc == null) {
+                Log.w(TAG, "Service $SERVICE_UUID not found")
+                return
+            }
+
+            val rx = svc.getCharacteristic(RX_CHAR_UUID)
+            val tx = svc.getCharacteristic(TX_CHAR_UUID)
+
+            if (tx == null) {
+                Log.w(TAG, "TX characteristic $TX_CHAR_UUID not found")
+                return
+            }
+
+            // cache rx char for subsequent writes
+            if (rx != null) remoteRxCharacteristic = rx
+
+            // Enable local notifications (app side)
+            val localSet = gatt.setCharacteristicNotification(tx, true)
+            Log.d(TAG, "setCharacteristicNotification returned: $localSet for ${tx.uuid}")
+
+            // Enable remote notifications by writing CCCD
+            val cccd = tx.getDescriptor(CCCD_UUID)
+            if (cccd == null) {
+                Log.w(TAG, "CCCD descriptor $CCCD_UUID not found on TX char")
+                return
+            }
+
+            cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            val writeStarted = gatt.writeDescriptor(cccd)
+            if (!writeStarted) {
+                Log.w(TAG, "writeDescriptor returned false (failed to start)")
+            } else {
+                Log.d(TAG, "writeDescriptor started for CCCD")
+            }
+        }
+
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            super.onDescriptorWrite(gatt, descriptor, status)
+            if (descriptor.uuid == CCCD_UUID) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    Log.i(TAG, "Successfully wrote CCCD; notifications enabled remotely.")
+                } else {
+                    Log.w(TAG, "Failed to write CCCD: status=$status")
+                }
+            } else {
+                Log.d(TAG, "Descriptor written: ${descriptor.uuid}, status=$status")
             }
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             super.onCharacteristicChanged(gatt, characteristic)
             if (characteristic.uuid == TX_CHAR_UUID) {
-                val msg = characteristic.value?.toString(Charset.forName("UTF-8")) ?: ""
+                val payload = characteristic.value
+                if (payload == null || payload.isEmpty()) {
+                    Log.i(TAG, "Received empty payload on ${characteristic.uuid}")
+                    return
+                }
+                // Proper conversion from bytes -> UTF-8 string
+                val msg = try {
+                    String(payload, Charsets.UTF_8)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to decode payload as UTF-8", e)
+                    // fallback: hex
+                    payload.joinToString(separator = " ") { "%02x".format(it) }
+                }
                 Log.i(TAG, "Client received notification: $msg")
-                // deliver to UI via callback
             }
         }
 
+        @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
             super.onCharacteristicWrite(gatt, characteristic, status)
-            Log.i(TAG, "Client write status=$status for ${characteristic.uuid}")
+            Log.d(TAG, "onCharacteristicWrite char=${characteristic.uuid} status=$status")
+            writeInProgress = false
+            // process next chunk if available
+            processNextWrite()
+
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.i(TAG, "Characteristic ${characteristic.uuid} write succeeded")
+            } else {
+                Log.w(TAG, "Characteristic ${characteristic.uuid} write failed: status=$status")
+            }
         }
+
     }
 
     @SuppressLint("MissingPermission")
@@ -390,19 +436,66 @@ class DualRoleBleManager(private val context: Context) {
             Log.w(TAG, "No client GATT connection")
             return
         }
-        val svc = gatt.getService(SERVICE_UUID) ?: run {
-            Log.w(TAG, "Service not found on remote device")
-            return
-        }
-        val rx = svc.getCharacteristic(RX_CHAR_UUID) ?: run {
-            Log.w(TAG, "RX characteristic not found on remote device")
-            return
+
+        val rx = remoteRxCharacteristic ?: run {
+
+            val svc = gatt.getService(SERVICE_UUID)
+            Log.w(TAG, "svc  : ${svc}")
+            val found = svc?.getCharacteristic(RX_CHAR_UUID)
+            if (found == null) {
+                Log.w(TAG, "RX characteristic not found on remote device")
+                return
+            } else {
+                remoteRxCharacteristic = found
+            }
+            remoteRxCharacteristic!!
         }
 
-        rx.value = message.toByteArray(Charset.forName("UTF-8"))
-        // use WRITE_NO_RESPONSE for higher throughput when supported
-        val ok = gatt.writeCharacteristic(rx)
-        Log.i(TAG, "client write initiated ok=$ok message=$message")
+        val bytes = message.toByteArray(Charsets.UTF_8)
+        Log.i(TAG, "client write bytes (hex): ${bytes.joinToString(" ") { "%02X".format(it) }}")
+
+        // Chunk by MTU-3
+        val chunkSize = if (currentMtu > 3) currentMtu - 3 else 20
+        synchronized(writeQueue) {
+            if (bytes.size <= chunkSize) {
+                writeQueue.addLast(rx to bytes)
+            } else {
+                var offset = 0
+                while (offset < bytes.size) {
+                    val end = minOf(bytes.size, offset + chunkSize)
+                    val slice = bytes.sliceArray(offset until end)
+                    writeQueue.addLast(rx to slice)
+                    offset = end
+                }
+            }
+        }
+        processNextWrite()
+    }
+
+    @androidx.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)
+    private fun processNextWrite() {
+        val gatt = bluetoothGatt ?: run {
+            writeInProgress = false
+            return
+        }
+        synchronized(writeQueue)  {
+            if (writeInProgress) return
+            val next = if (writeQueue.isEmpty()) null else writeQueue.removeFirst()
+            if (next == null) return
+            val (char, bytes) = next
+            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT // request response for reliability
+            char.value = bytes
+            writeInProgress = true
+            val started = gatt.writeCharacteristic(char)
+            if (!started) {
+                Log.w(TAG, "writeCharacteristic failed to start")
+                writeInProgress = false
+                // If failed to start, try next after brief fallback
+                processNextWrite()
+            } else {
+                Log.d(TAG, "writeCharacteristic started len=${bytes.size}")
+            }
+        }
     }
 
     // ------------------ CLEANUP ------------------

@@ -149,8 +149,9 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             // Start advertising (BleAdvertiser handles its own permission checks too)
-            bleAdvertiser.startAdvertising()
             dualrole.startGattServer()
+            bleAdvertiser.startAdvertising()
+
             statusText.text = "Status: Advertising..."
         }
 
@@ -162,14 +163,27 @@ class MainActivity : AppCompatActivity() {
                 bleScanner.stopScan()
             }
             val device = bldevices[position]
-            Log.d("item click" , "device-name :${device.name}")
+            Log.d("item click", "device-name :${device.name}")
+
+            // set a one-shot connected callback
+            dualrole.onClientConnected = { connectedDevice ->
+                Log.i("MainActivity", "onClientConnected callback for ${connectedDevice.address}")
+
+                // send hello once connected
+                dualrole.clientWrite("hi i am motorola")
+
+                // clear callback if not needed again
+                dualrole.onClientConnected = null
+            }
+
+// now start connection
             dualrole.connectToDevice(device)
-            dualrole.clientWrite("hi i am motorola")
-//            val intent = Intent(this, ChatActivity::class.java).apply {
-//                putExtra("device_address", device.address)
-//            }
-            startActivity(intent)
+
+
+
+            // Optionally open ChatActivity when connection established (in the callback)
         }
+
     }
 
     // ... keep your existing onActivityResult, checkPermissionsAndEnableBluetooth, onRequestPermissionsResult ...
