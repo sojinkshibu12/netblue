@@ -171,6 +171,7 @@ class MainActivity : AppCompatActivity() {
 
                 // send hello once connected
                 dualrole.clientWrite("hi i am motorola")
+                dualrole.clientWrite("my name is sojin")
 
                 // clear callback if not needed again
                 dualrole.onClientConnected = null

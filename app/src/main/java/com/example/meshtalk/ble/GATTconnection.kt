@@ -32,6 +32,8 @@ class DualRoleBleManager(private val context: Context) {
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb") }
 
     private val bluetoothManager: BluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+    @Volatile
+    private var notificationsReady = false
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
     private var gattServer: BluetoothGattServer? = null
 
@@ -219,7 +221,9 @@ class DualRoleBleManager(private val context: Context) {
                 // persist the written value on the descriptor object
                 descriptor.value = value
 
-                val enabled = Arrays.equals(value, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                val enabled = value != null &&
+                        value.isNotEmpty() &&
+                        (value[0].toInt() and 0x01) != 0
                 if (enabled) notifyEnabledDevices.add(device.address) else notifyEnabledDevices.remove(device.address)
 
                 Log.i(TAG, "Server descriptor write: enable notifications=$enabled from ${device.address}")
@@ -300,14 +304,8 @@ class DualRoleBleManager(private val context: Context) {
             super.onConnectionStateChange(gatt, status, newState)
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 Log.i(TAG, "Client connected -> discoverServices")
-                // notify listener that client connected (UI can now safely call clientWrite)
-                try {
-                    onClientConnected?.invoke(gatt.device)
-                } catch (e: Exception) {
-                    Log.w(TAG, "onClientConnected handler threw: ${'$'}{e.message}")
-                }
-                // keep reference
                 bluetoothGatt = gatt
+                notificationsReady = false
                 // try request high MTU (best-effort)
                 try {
                     gatt.requestMtu(247)
@@ -315,6 +313,7 @@ class DualRoleBleManager(private val context: Context) {
                     Log.w(TAG, "requestMtu failed: ${e.message}")
                 }
                 gatt.discoverServices()
+
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.i(TAG, "Client disconnected")
                 bluetoothGatt?.close()
@@ -384,7 +383,10 @@ class DualRoleBleManager(private val context: Context) {
             super.onDescriptorWrite(gatt, descriptor, status)
             if (descriptor.uuid == CCCD_UUID) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
+                    notificationsReady = true
+                    Log.i(TAG, "Notifications ENABLED for ${gatt.device.address}")
                     Log.i(TAG, "Successfully wrote CCCD; notifications enabled remotely.")
+                    onClientConnected?.invoke(gatt.device)
                 } else {
                     Log.w(TAG, "Failed to write CCCD: status=$status")
                 }
@@ -432,6 +434,10 @@ class DualRoleBleManager(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     fun clientWrite(message: String) {
+        if (!notificationsReady) {
+            Log.w(TAG, "clientWrite blocked: notifications not ready")
+            return
+        }
         val gatt = bluetoothGatt ?: run {
             Log.w(TAG, "No client GATT connection")
             return
