@@ -2,16 +2,13 @@ package com.example.meshtalk
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.os.Bundle
-import android.widget.ArrayAdapter
-import android.widget.Button
-import android.widget.EditText
-import android.widget.ListView
-import android.widget.TextView
+import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
-import com.example.meshtalk.bluetooth.BluetoothSocketManager
+import com.example.dualroleble.DualRoleBleManager
+//import com.example.meshtalk.R
+
 
 @SuppressLint("MissingPermission")
 class ChatActivity : AppCompatActivity() {
@@ -19,46 +16,57 @@ class ChatActivity : AppCompatActivity() {
     private lateinit var listMessages: ListView
     private lateinit var etMessage: EditText
     private lateinit var tvChatStatus: TextView
-    private lateinit var btManager: BluetoothSocketManager
-    private lateinit var bluetoothAdapter: BluetoothAdapter
+    private lateinit var btnSend: Button
+
     private lateinit var messageAdapter: ArrayAdapter<String>
+    private lateinit var dualRole: DualRoleBleManager
+    private lateinit var bluetoothAdapter: BluetoothAdapter
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_chat)
 
+        // UI
         listMessages = findViewById(R.id.listMessages)
         etMessage = findViewById(R.id.etMessage)
         tvChatStatus = findViewById(R.id.tvChatStatus)
-        val btnSend = findViewById<Button>(R.id.btnSend)
+        btnSend = findViewById(R.id.btnSend)
 
         messageAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1)
         listMessages.adapter = messageAdapter
 
+        // Bluetooth
         val bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager.adapter
 
+        // BLE Manager
+        dualRole = DualRoleBleManager(
+            context = this,
+
+        )
+        dualRole.onMessageReceived = { msg ->
+            runOnUiThread {
+                addMessage("Friend: $msg")
+            }
+        }
+
         val deviceAddress = intent.getStringExtra("device_address")
 
-        btManager = BluetoothSocketManager(
-            adapter = bluetoothAdapter,
-            onMessageReceived = { msg -> runOnUiThread { addMessage("Friend: $msg") } },
-            onStatusUpdate = { status -> runOnUiThread { tvChatStatus.text = "Chat Status: $status" } }
-        )
-
-        if (deviceAddress == null) {
-            // No address passed, so start in SERVER mode
-            btManager.startServer()
-        } else {
-            // Address was passed, so start in CLIENT mode
-            val device: BluetoothDevice = bluetoothAdapter.getRemoteDevice(deviceAddress)
-            btManager.connectToDevice(device)
-        }
+//        if (deviceAddress == null) {
+//            // 🟢 SERVER MODE (advertise + GATT server)
+//            tvChatStatus.text = "Waiting for connection..."
+//            dualRole.startServer()
+//        } else {
+//            // 🔵 CLIENT MODE (connect as GATT client)
+//            val device = bluetoothAdapter.getRemoteDevice(deviceAddress)
+//            tvChatStatus.text = "Connecting..."
+//            dualRole.connectToDevice(device)
+//        }
 
         btnSend.setOnClickListener {
             val msg = etMessage.text.toString()
-            if (msg.isNotEmpty()) {
-                btManager.sendMessage(msg)
+            if (msg.isNotBlank()) {
+                dualRole.clientWrite(msg)
                 addMessage("You: $msg")
                 etMessage.text.clear()
             }
@@ -67,10 +75,11 @@ class ChatActivity : AppCompatActivity() {
 
     private fun addMessage(message: String) {
         messageAdapter.add(message)
+        listMessages.smoothScrollToPosition(messageAdapter.count - 1)
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        btManager.close()
+
     }
 }

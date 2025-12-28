@@ -24,6 +24,8 @@ import kotlin.collections.ArrayDeque
  */
 class DualRoleBleManager(private val context: Context) {
     private val TAG = "DualRoleBleManager"
+    var onMessageReceived: ((String) -> Unit)? = null
+
 
     companion object {
         val SERVICE_UUID: UUID = UUID.fromString("0000abcd-0000-1000-8000-00805f9b34fb")
@@ -184,9 +186,10 @@ class DualRoleBleManager(private val context: Context) {
             }
 
             if (characteristic.uuid == RX_CHAR_UUID) {
+                ///////////////////////////
                 val text = try { String(bytes, Charsets.UTF_8) } catch (e: Exception) { bytes.joinToString(" ") { "%02X".format(it) } }
                 Log.i(TAG, "Server received from client(${device.address}): $text")
-
+                onMessageReceived?.invoke(text)
                 // Prefer notifying the specific device that sent the message
                 // send text as-is (don't add duplicate "Echo:" twice)
                 notifyDevice(device, "Echo: $text")
@@ -300,22 +303,32 @@ class DualRoleBleManager(private val context: Context) {
 
     private val gattClientCallback = object : BluetoothGattCallback() {
         @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+        override fun onConnectionStateChange(
+            gatt: BluetoothGatt,
+            status: Int,
+            newState: Int
+        ) {
             super.onConnectionStateChange(gatt, status, newState)
+
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                Log.i(TAG, "Client connected -> discoverServices")
+                Log.i(TAG, "Client connected")
+
                 bluetoothGatt = gatt
                 notificationsReady = false
-                // try request high MTU (best-effort)
+
+                // Try MTU (best effort, optional)
                 try {
                     gatt.requestMtu(247)
                 } catch (e: Exception) {
                     Log.w(TAG, "requestMtu failed: ${e.message}")
                 }
+
+                // 🔥 ALWAYS do this
                 gatt.discoverServices()
 
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.i(TAG, "Client disconnected")
+
                 bluetoothGatt?.close()
                 bluetoothGatt = null
                 remoteRxCharacteristic = null
@@ -323,15 +336,17 @@ class DualRoleBleManager(private val context: Context) {
                 writeInProgress = false
             }
         }
-
+        @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             super.onMtuChanged(gatt, mtu, status)
+
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 currentMtu = mtu
                 Log.i(TAG, "MTU changed: $mtu")
             } else {
                 Log.w(TAG, "MTU change failed status=$status")
             }
+            // ❌ DO NOT call discoverServices() here
         }
 
         @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
