@@ -19,7 +19,7 @@ class ChatActivity : AppCompatActivity() {
     private lateinit var btnSend: Button
 
     private lateinit var messageAdapter: ArrayAdapter<String>
-    private lateinit var dualRole: DualRoleBleManager
+    private var dualRole: DualRoleBleManager = BleManagerHolder.dualRole
     private lateinit var bluetoothAdapter: BluetoothAdapter
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -35,15 +35,9 @@ class ChatActivity : AppCompatActivity() {
         messageAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1)
         listMessages.adapter = messageAdapter
 
-        // Bluetooth
-        val bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
-        bluetoothAdapter = bluetoothManager.adapter
 
         // BLE Manager
-        dualRole = DualRoleBleManager(
-            context = this,
 
-        )
         dualRole.onMessageReceived = { msg ->
             runOnUiThread {
                 addMessage("Friend: $msg")
@@ -66,7 +60,7 @@ class ChatActivity : AppCompatActivity() {
         btnSend.setOnClickListener {
             val msg = etMessage.text.toString()
             if (msg.isNotBlank()) {
-                dualRole.clientWrite(msg)
+                dualRole.sendMessage(msg)
                 addMessage("You: $msg")
                 etMessage.text.clear()
             }

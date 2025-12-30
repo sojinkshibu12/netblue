@@ -124,8 +124,11 @@ class BleScanner(
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
-
-        val filters: List<ScanFilter> = listOf() // add ScanFilter if you want to filter devices
+        val filters: List<ScanFilter> = listOf(
+            ScanFilter.Builder()
+                .setServiceUuid(ParcelUuid.fromString("0000abcd-0000-1000-8000-00805f9b34fb"))
+                .build()
+        ) // add ScanFilter if you want to filter devices
 
         scanner.startScan(filters, settings, scanCallback)
         isScanning = true

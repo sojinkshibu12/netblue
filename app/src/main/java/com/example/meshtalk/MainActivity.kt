@@ -25,7 +25,9 @@ import com.example.meshtalk.ble.BleAdvertiser
 import com.example.meshtalk.ui.Device
 import com.example.meshtalk.ui.DeviceAdapter
 
-
+object BleManagerHolder {
+    lateinit var dualRole: DualRoleBleManager
+}
 
 @SuppressLint("MissingPermission")
 class MainActivity : AppCompatActivity() {
@@ -48,6 +50,8 @@ class MainActivity : AppCompatActivity() {
     private val REQUEST_ADVERT_PERMS = 2002
     private val deviceAdapter = DeviceAdapter(deviceList,this)
     lateinit var dualrole: DualRoleBleManager
+
+
 
 
 
@@ -158,6 +162,7 @@ class MainActivity : AppCompatActivity() {
 
 
 
+
         listView.setOnItemClickListener { _, _, position, _ ->
             if (this::bleScanner.isInitialized && bleScanner.isScanning()) {
                 bleScanner.stopScan()
@@ -168,10 +173,15 @@ class MainActivity : AppCompatActivity() {
             // set a one-shot connected callback
             dualrole.onClientConnected = { connectedDevice ->
                 Log.i("MainActivity", "onClientConnected callback for ${connectedDevice.address}")
+                BleManagerHolder.dualRole = dualrole
 
                 // send hello once connected
                 dualrole.clientWrite("hi i am motorola")
                 dualrole.clientWrite("my name is sojin")
+                val intent = Intent(this, ChatActivity::class.java).apply {
+                    putExtra("device_address", connectedDevice.address)
+                }
+                startActivity(intent)
 
                 // clear callback if not needed again
                 dualrole.onClientConnected = null
@@ -184,6 +194,7 @@ class MainActivity : AppCompatActivity() {
 
             // Optionally open ChatActivity when connection established (in the callback)
         }
+
 
     }
 
