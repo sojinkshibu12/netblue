@@ -39,8 +39,8 @@ Notify ← TX Characteristic <--- GATT Server
 - **Minimum Android Version:** Android 8.0 (API 26+)
 
 ### Required Permissions
-BLUETOOTH_CONNECT
-BLUETOOTH_SCAN
+BLUETOOTH_CONNECT,
+BLUETOOTH_SCAN,
 BLUETOOTH_ADVERTISE
 
 ## 📂 Project Structure
