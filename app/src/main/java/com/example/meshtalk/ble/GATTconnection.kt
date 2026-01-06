@@ -74,6 +74,57 @@ class DualRoleBleManager(private val context: Context) {
     @Volatile
     private var serverReady = false
 
+    private val receiveBuffer = java.io.ByteArrayOutputStream()
+    private var expectedLength = -1
+
+
+    private fun encodeMessage(data: ByteArray): ByteArray {
+        val length = data.size
+        val header = ByteArray(4)
+        header[0] = (length shr 24).toByte()
+        header[1] = (length shr 16).toByte()
+        header[2] = (length shr 8).toByte()
+        header[3] = length.toByte()
+        return header + data
+    }
+
+
+    private fun onChunkReceived(chunk: ByteArray) {
+        receiveBuffer.write(chunk)
+
+        // Step 1: Read expected length
+        if (expectedLength == -1 && receiveBuffer.size() >= 4) {
+            val data = receiveBuffer.toByteArray()
+            expectedLength =
+                ((data[0].toInt() and 0xFF) shl 24) or
+                        ((data[1].toInt() and 0xFF) shl 16) or
+                        ((data[2].toInt() and 0xFF) shl 8) or
+                        (data[3].toInt() and 0xFF)
+
+            receiveBuffer.reset()
+            receiveBuffer.write(data, 4, data.size - 4)
+        }
+
+        // Step 2: Full message received?
+        if (expectedLength != -1 && receiveBuffer.size() >= expectedLength) {
+            val msgBytes = receiveBuffer.toByteArray()
+                .copyOfRange(0, expectedLength)
+
+            val message = try {
+                String(msgBytes, Charsets.UTF_8)
+            } catch (e: Exception) {
+                msgBytes.joinToString(" ") { "%02X".format(it) }
+            }
+
+            onMessageReceived?.invoke(message)
+
+            // Reset for next message
+            receiveBuffer.reset()
+            expectedLength = -1
+        }
+    }
+
+
     // ------------------ GATT SERVER (Peripheral) ------------------
 
     @SuppressLint("MissingPermission")
@@ -194,9 +245,9 @@ class DualRoleBleManager(private val context: Context) {
 
             if (characteristic.uuid == RX_CHAR_UUID) {
                 ///////////////////////////
-                val text = try { String(bytes, Charsets.UTF_8) } catch (e: Exception) { bytes.joinToString(" ") { "%02X".format(it) } }
-                Log.i(TAG, "Server received from client(${device.address}): $text")
-                onMessageReceived?.invoke(text)
+                onChunkReceived(bytes)
+
+
                 // Prefer notifying the specific device that sent the message
                 // send text as-is (don't add duplicate "Echo:" twice)
 //                notifyDevice(device, "Echo: $text")
@@ -266,7 +317,7 @@ class DualRoleBleManager(private val context: Context) {
     @SuppressLint("MissingPermission")
     fun notifyConnectedClients(text: String) {
         Log.d(TAG, "notifyConnectedClients: $text")
-        val bytes = text.toByteArray(Charsets.UTF_8)
+        val bytes = encodeMessage(text.toByteArray(Charsets.UTF_8))
         val char = serverTxCharacteristic ?: run {
             Log.w(TAG, "serverTxCharacteristic is null")
             return
@@ -286,7 +337,8 @@ class DualRoleBleManager(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     fun notifyDevice(device: BluetoothDevice, text: String) {
-        val bytes = text.toByteArray(Charsets.UTF_8)
+        val bytes = encodeMessage(text.toByteArray(Charsets.UTF_8))
+
         val char = serverTxCharacteristic ?: run {
             Log.w(TAG, "serverTxCharacteristic is null")
             return
@@ -395,6 +447,7 @@ class DualRoleBleManager(private val context: Context) {
                 return
             }
 
+
             // cache rx char for subsequent writes
             if (rx != null) remoteRxCharacteristic = rx
 
@@ -443,15 +496,17 @@ class DualRoleBleManager(private val context: Context) {
                     return
                 }
                 // Proper conversion from bytes -> UTF-8 string
-                val msg = try {
-                    String(payload, Charsets.UTF_8)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to decode payload as UTF-8", e)
-                    // fallback: hex
-                    payload.joinToString(separator = " ") { "%02x".format(it) }
-                }
-                onMessageReceived?.invoke(msg)
-                Log.i(TAG, "Client received notification: $msg")
+//                val msg = try {
+//                    String(payload, Charsets.UTF_8)
+//                } catch (e: Exception) {
+//                    Log.w(TAG, "Failed to decode payload as UTF-8", e)
+//                    // fallback: hex
+//                    payload.joinToString(separator = " ") { "%02x".format(it) }
+//                }
+//                onMessageReceived?.invoke(msg)
+                onChunkReceived(payload)
+
+//                Log.i(TAG, "Client received notification: $msg")
             }
         }
 
@@ -493,7 +548,8 @@ class DualRoleBleManager(private val context: Context) {
             remoteRxCharacteristic!!
         }
 
-        val bytes = message.toByteArray(Charsets.UTF_8)
+        val bytes = encodeMessage(message.toByteArray(Charsets.UTF_8))
+
         Log.i(TAG, "client write bytes (hex): ${bytes.joinToString(" ") { "%02X".format(it) }}")
 
         // Chunk by MTU-3
