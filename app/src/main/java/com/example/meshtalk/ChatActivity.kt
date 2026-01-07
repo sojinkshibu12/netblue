@@ -1,79 +1,84 @@
 package com.example.meshtalk
 
 import android.annotation.SuppressLint
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothManager
+import android.graphics.Color
 import android.os.Bundle
+import android.view.Gravity
+import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import com.example.dualroleble.DualRoleBleManager
-//import com.example.meshtalk.R
-
 
 @SuppressLint("MissingPermission")
 class ChatActivity : AppCompatActivity() {
 
-    private lateinit var listMessages: ListView
     private lateinit var etMessage: EditText
-    private lateinit var tvChatStatus: TextView
     private lateinit var btnSend: Button
+    private lateinit var chatContainer: LinearLayout
+    private lateinit var chatScrollView: ScrollView
 
-    private lateinit var messageAdapter: ArrayAdapter<String>
-    private var dualRole: DualRoleBleManager = BleManagerHolder.dualRole
-    private lateinit var bluetoothAdapter: BluetoothAdapter
+    private val dualRole: DualRoleBleManager = BleManagerHolder.dualRole
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_chat)
 
-        // UI
-        listMessages = findViewById(R.id.listMessages)
+        // ✅ Bind views
         etMessage = findViewById(R.id.etMessage)
-        tvChatStatus = findViewById(R.id.tvChatStatus)
         btnSend = findViewById(R.id.btnSend)
+        chatContainer = findViewById(R.id.chatContainer)
+        chatScrollView = findViewById(R.id.chatScrollView)
 
-        messageAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1)
-        listMessages.adapter = messageAdapter
-
-
-        // BLE Manager
-
+        // ✅ Receive BLE message
         dualRole.onMessageReceived = { msg ->
             runOnUiThread {
-                addMessage("Friend: $msg")
+                addMessageBubble(" $msg", isMe = false)
             }
         }
 
-        val deviceAddress = intent.getStringExtra("device_address")
-
-//        if (deviceAddress == null) {
-//            // 🟢 SERVER MODE (advertise + GATT server)
-//            tvChatStatus.text = "Waiting for connection..."
-//            dualRole.startServer()
-//        } else {
-//            // 🔵 CLIENT MODE (connect as GATT client)
-//            val device = bluetoothAdapter.getRemoteDevice(deviceAddress)
-//            tvChatStatus.text = "Connecting..."
-//            dualRole.connectToDevice(device)
-//        }
-
+        // ✅ Send message
         btnSend.setOnClickListener {
-            val msg = etMessage.text.toString()
-            if (msg.isNotBlank()) {
+            val msg = etMessage.text.toString().trim()
+            if (msg.isNotEmpty()) {
                 dualRole.sendMessage(msg)
-                addMessage("You: $msg")
+                addMessageBubble(" $msg", isMe = true)
                 etMessage.text.clear()
             }
         }
     }
 
-    private fun addMessage(message: String) {
-        messageAdapter.add(message)
-        listMessages.smoothScrollToPosition(messageAdapter.count - 1)
-    }
+    // 🔥 CREATE ONE LINEARLAYOUT PER MESSAGE
+    private fun addMessageBubble(text: String, isMe: Boolean) {
 
-    override fun onDestroy() {
-        super.onDestroy()
+        val messageRow = LinearLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            gravity = if (isMe) Gravity.END else Gravity.START
+            setPadding(8, 4, 8, 4)
+        }
 
+        val messageText = TextView(this).apply {
+            this.text = text
+            textSize = 16f
+            maxWidth = 700
+            setPadding(24, 12, 24, 12)
+            setTextColor(Color.WHITE)
+            setBackgroundColor(
+                if (isMe)
+                    Color.parseColor("#4CAF50")   // right (me)
+                else
+                    Color.parseColor("#607D8B")   // left (friend)
+            )
+        }
+
+        messageRow.addView(messageText)
+        chatContainer.addView(messageRow)
+
+        // ✅ Auto scroll
+        chatScrollView.post {
+            chatScrollView.fullScroll(View.FOCUS_DOWN)
+        }
     }
 }
