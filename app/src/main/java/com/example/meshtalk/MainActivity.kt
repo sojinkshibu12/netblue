@@ -110,6 +110,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         checkPermissionsAndEnableBluetooth()
+        dualrole.initKeys()
+
 
         // Initialize BleScanner
         bleScanner = BleScanner(

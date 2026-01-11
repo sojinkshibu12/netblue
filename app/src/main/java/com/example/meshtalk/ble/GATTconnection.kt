@@ -10,6 +10,25 @@ import java.nio.charset.Charset
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.collections.ArrayDeque
+import com.google.gson.Gson
+import android.util.Base64
+import java.security.KeyPair
+import java.security.KeyPairGenerator
+import java.security.PrivateKey
+import java.security.PublicKey
+import java.security.spec.ECGenParameterSpec
+
+
+
+private fun generateEcKeyPair(): KeyPair {
+    val keyPairGenerator = KeyPairGenerator.getInstance("EC")
+
+    // Use a standard, secure curve
+    val ecSpec = ECGenParameterSpec("secp256r1") // a.k.a prime256v1
+    keyPairGenerator.initialize(ecSpec)
+
+    return keyPairGenerator.generateKeyPair()
+}
 
 /**
  * DualRoleBleManager
@@ -22,9 +41,16 @@ import kotlin.collections.ArrayDeque
  *   * Fix pending reply queue usage and make notify behavior deterministic
  *   * Minor safety and logging improvements
  */
+data class BlePacket(
+    val message: String,
+    val publicKey: String, // ✅ Base64 STRING
+    val ttl: Long
+)
+
 class DualRoleBleManager(private val context: Context) {
     private val TAG = "DualRoleBleManager"
     var onMessageReceived: ((String) -> Unit)? = null
+    private val gson = Gson()
 
 
     companion object {
@@ -76,6 +102,28 @@ class DualRoleBleManager(private val context: Context) {
 
     private val receiveBuffer = java.io.ByteArrayOutputStream()
     private var expectedLength = -1
+    private lateinit var myPrivateKey: PrivateKey
+    private lateinit var myPublicKey: PublicKey
+
+
+    fun initKeys() {
+        val keyPair = generateEcKeyPair()
+        myPrivateKey = keyPair.private
+        myPublicKey = keyPair.public
+
+        Log.i(TAG, "EC key pair generated")
+    }
+
+    private fun serializePacket(packet: BlePacket): ByteArray {
+        val json = gson.toJson(
+            mapOf(
+                "message" to packet.message,
+                "publicKey" to packet.publicKey,
+                "ttl" to packet.ttl
+            )
+        )
+        return json.toByteArray(Charsets.UTF_8)
+    }
 
 
     private fun encodeMessage(data: ByteArray): ByteArray {
@@ -111,17 +159,32 @@ class DualRoleBleManager(private val context: Context) {
                 .copyOfRange(0, expectedLength)
 
             val message = try {
-                String(msgBytes, Charsets.UTF_8)
+                String(msgBytes, Charsets.UTF_8).trim()
             } catch (e: Exception) {
-                msgBytes.joinToString(" ") { "%02X".format(it) }
+                Log.e(TAG, "Failed to decode payload", e)
+                resetReceiveState()
+                return
             }
 
-            onMessageReceived?.invoke(message)
+// 🔐 ABSOLUTE SAFETY CHECK
+            if (!message.startsWith("{")) {
+//                Log.e(TAG, "NON-JSON payload received: $message")
+                onMessageReceived?.invoke(message) // treat as plain text
+                resetReceiveState()
+                return
+            }
+            val mess = deserializePacket(message)
+            onMessageReceived?.invoke(mess.message)
 
             // Reset for next message
             receiveBuffer.reset()
             expectedLength = -1
         }
+
+    }
+    private fun resetReceiveState() {
+        receiveBuffer.reset()
+        expectedLength = -1
     }
 
 
@@ -297,7 +360,9 @@ class DualRoleBleManager(private val context: Context) {
                 if (enabled) {
                     val q = pendingReplies.remove(device.address)
                     q?.forEach { msg ->
-                        notifyDevice(device, msg)
+//                        notifyDevice(device, msg)
+
+
                     }
                 }
             } else {
@@ -315,25 +380,37 @@ class DualRoleBleManager(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    fun notifyConnectedClients(text: String) {
-        Log.d(TAG, "notifyConnectedClients: $text")
-        val bytes = encodeMessage(text.toByteArray(Charsets.UTF_8))
+    fun notifyConnectedClients(jsonPayload: String) {
+        // SAFETY: ensure only JSON is sent
+        if (!jsonPayload.trim().startsWith("{")) {
+            Log.e(TAG, "Blocked non-JSON notify payload: $jsonPayload")
+            return
+        }
+
+        val bytes = encodeMessage(jsonPayload.toByteArray(Charsets.UTF_8))
+
         val char = serverTxCharacteristic ?: run {
             Log.w(TAG, "serverTxCharacteristic is null")
             return
         }
+
         char.value = bytes
 
         connectedDevices.forEach { device ->
             if (!notifyEnabledDevices.contains(device.address)) {
-                Log.d(TAG, "Skipping notify: ${device.address} has not enabled notifications; queueing")
-                pendingReplies.getOrPut(device.address) { ArrayDeque() }.add(text)
+                pendingReplies
+                    .getOrPut(device.address) { ArrayDeque() }
+                    .add(jsonPayload)
                 return@forEach
             }
-            val success = gattServer?.notifyCharacteristicChanged(device, char, false) ?: false
+
+            val success =
+                gattServer?.notifyCharacteristicChanged(device, char, false) ?: false
+
             Log.i(TAG, "notify to ${device.address} success=$success")
         }
     }
+
 
     @SuppressLint("MissingPermission")
     fun notifyDevice(device: BluetoothDevice, text: String) {
@@ -504,6 +581,7 @@ class DualRoleBleManager(private val context: Context) {
 //                    payload.joinToString(separator = " ") { "%02x".format(it) }
 //                }
 //                onMessageReceived?.invoke(msg)
+
                 onChunkReceived(payload)
 
 //                Log.i(TAG, "Client received notification: $msg")
@@ -596,20 +674,37 @@ class DualRoleBleManager(private val context: Context) {
         }
     }
 
-    fun sendMessage(text: String) {
+    fun sendMessage(text: String, ttl: Long) {
+        // Convert PublicKey → Base64 string
+        val publicKeyBase64 =
+            Base64.encodeToString(myPublicKey.encoded, Base64.NO_WRAP)
+
+        val packet = BlePacket(
+            message = text,
+            publicKey = publicKeyBase64, // ✅ STRING, not PublicKey
+            ttl = ttl
+        )
+
+        val bytes = serializePacket(packet)
+        val payload = String(bytes, Charsets.UTF_8)
+
         when {
             bluetoothGatt != null -> {
                 // CLIENT → SERVER (RX write)
-                clientWrite(text)
+                clientWrite(payload)
             }
             connectedDevices.isNotEmpty() -> {
                 // SERVER → CLIENT (TX notify)
-                notifyConnectedClients(text)
+                notifyConnectedClients(payload)
             }
             else -> {
                 Log.w(TAG, "No BLE connection available to send message")
             }
         }
+    }
+
+    private fun deserializePacket(json: String): BlePacket {
+        return gson.fromJson(json, BlePacket::class.java)
     }
 
     // ------------------ CLEANUP ------------------

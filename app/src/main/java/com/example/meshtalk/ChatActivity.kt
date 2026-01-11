@@ -40,7 +40,7 @@ class ChatActivity : AppCompatActivity() {
         btnSend.setOnClickListener {
             val msg = etMessage.text.toString().trim()
             if (msg.isNotEmpty()) {
-                dualRole.sendMessage(msg)
+                dualRole.sendMessage(msg,3)
                 addMessageBubble(" $msg", isMe = true)
                 etMessage.text.clear()
             }
