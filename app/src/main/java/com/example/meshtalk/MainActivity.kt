@@ -71,6 +71,7 @@ class MainActivity : AppCompatActivity() {
         adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1)
         listView.adapter = adapter
         dualrole = DualRoleBleManager(this)
+        BleManagerHolder.dualRole = dualrole
 
         fun checkPermissionsAndEnableBluetooth() {
 
@@ -178,8 +179,8 @@ class MainActivity : AppCompatActivity() {
                 BleManagerHolder.dualRole = dualrole
 
                 // send hello once connected
-                dualrole.clientWrite("hi i am motorola")
-                dualrole.clientWrite("my name is sojin")
+//                dualrole.clientWrite("hi i am motorola")
+//                dualrole.clientWrite("my name is sojin")
                 val intent = Intent(this, ChatActivity::class.java).apply {
                     putExtra("device_address", connectedDevice.address)
                 }
@@ -235,5 +236,4 @@ class MainActivity : AppCompatActivity() {
         }
     }
 }
-
 
